@@ -1,114 +1,85 @@
 import sys
 import os
-import tempfile
 import zipfile
 import shutil
+import tempfile
 import tkinter as tk
 from tkinter import scrolledtext
-from tkinter import messagebox
 
 
 class ShellEmulator:
     def __init__(self, user_name, fs_zip_path):
         self.user_name = user_name
         self.fs_zip_path = fs_zip_path
-        self.temp_dir = tempfile.mkdtemp(prefix="virtfs_")
-
-        # Извлечение zip-архива во временную директорию
-        with zipfile.ZipFile(self.fs_zip_path, 'r') as zf:
-            zf.extractall(self.temp_dir)
-
-        # Предполагается, что корнем является поддиректория, например root
-        self.root_dir = os.path.join(self.temp_dir, "root")
-        if not os.path.exists(self.root_dir):
-            # Если root нет, примем temp_dir как root
-            self.root_dir = self.temp_dir
-        self.current_dir = self.root_dir
+        self.zip_file = zipfile.ZipFile(self.fs_zip_path, 'a')  # Открываем в режиме добавления для модификации
+        self.current_dir = "/"  # Текущая директория
 
     def get_prompt(self):
-        # Относительный путь относительно root
-        rel_path = os.path.relpath(self.current_dir, self.root_dir)
-        if rel_path == ".":
-            rel_path = "/"
-        else:
-            rel_path = "/" + rel_path.replace("\\", "/")  # Для Windows совместимости
-        return f"{self.user_name}@virtfs:{rel_path}$ "
+        return f"{self.user_name}@virtfs:{self.current_dir}$ "
 
     def ls_command(self):
-        try:
-            entries = os.listdir(self.current_dir)
-            entries.sort()
-            return "\n".join(entries) if entries else ""
-        except Exception as e:
-            return f"Ошибка: {e}"
+        entries = self._list_dir(self.current_dir)
+        return "\n".join(entries) if entries else ""
 
     def cd_command(self, path):
         new_path = self.resolve_path(path)
         if new_path is None:
             return f"Нет такого каталога: {path}"
-        elif not os.path.isdir(new_path):
+        if not self._is_dir(new_path):
             return f"Не является каталогом: {path}"
-        else:
-            self.current_dir = new_path
-            return ""
+        self.current_dir = new_path
+        return ""
 
     def pwd_command(self):
-        # Отобразить путь от "корня" виртуальной ФС
-        rel_path = os.path.relpath(self.current_dir, self.root_dir)
-        if rel_path == ".":
-            rel_path = "/"
-        else:
-            rel_path = "/" + rel_path.replace("\\", "/")  # Для Windows совместимости
-        return rel_path
+        return self.current_dir
 
     def mv_command(self, src, dst):
-        src_path = self.resolve_path(src, must_exist=True)
+        src_path = self.resolve_path(src)
+        dst_path = self.resolve_path(dst, is_dst=True)
+
         if src_path is None:
             return f"Нет такого файла или директории: {src}"
-
-        # Проверяем, что источник существует
-        if not os.path.exists(src_path):
-            return f"Нет такого файла или директории: {src}"
-
-        dst_path = self.resolve_path(dst, must_exist=False)
         if dst_path is None:
             return f"Некорректный путь назначения: {dst}"
 
-        # Если dst - существующая директория, переместим внутрь нее
-        if os.path.isdir(dst_path):
-            dst_path = os.path.join(dst_path, os.path.basename(src_path))
-        else:
-            # Если dst не существует, предполагаем, что это новое имя или путь
-            parent_dst = os.path.dirname(dst_path)
-            if not os.path.isdir(parent_dst):
-                return f"Путь назначения не является каталогом: {parent_dst}"
+        # Проверяем, существует ли источник
+        if not self._path_exists(src_path):
+            return f"Нет такого файла или директории: {src}"
+
+        # Проверяем, является ли назначение директорией
+        if self._is_dir(dst_path):
+            dst_path = os.path.join(dst_path, os.path.basename(src_path)).replace("\\", "/")
 
         try:
-            shutil.move(src_path, dst_path)
+            self._rename_in_zip(src_path, dst_path)
             return ""
         except Exception as e:
             return f"Ошибка перемещения: {e}"
 
     def exit_command(self):
-        # Очистка временной директории
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        self.zip_file.close()
         return "EXIT"
 
-    def resolve_path(self, path, must_exist=True):
-        # Определение, является ли путь абсолютным
+    def resolve_path(self, path, is_dst=False):
         if path.startswith("/"):
-            tentative_path = os.path.normpath(os.path.join(self.root_dir, path.lstrip("/")))
+            tentative_path = os.path.normpath(path)
         else:
             tentative_path = os.path.normpath(os.path.join(self.current_dir, path))
 
-        # Проверка, что tentative_path находится внутри root_dir
-        if os.path.commonpath([self.root_dir, tentative_path]) != self.root_dir:
-            return None  # Попытка выйти за пределы виртуальной ФС
+        # Убедимся, что путь начинается с '/'
+        if not tentative_path.startswith("/"):
+            tentative_path = "/" + tentative_path
 
-        if must_exist and not os.path.exists(tentative_path):
-            return None
+        # Нормализуем путь для директорий
+        if is_dst and not tentative_path.endswith("/"):
+            # Мы не знаем, является ли это директорией, оставляем как есть
+            pass
+        elif self._is_dir(tentative_path):
+            if not tentative_path.endswith("/"):
+                tentative_path += "/"
 
-        return tentative_path
+        # Возвращаем путь с нормализованными разделителями
+        return tentative_path.replace("\\", "/")
 
     def run_command(self, command_line):
         parts = command_line.strip().split()
@@ -121,7 +92,7 @@ class ShellEmulator:
             return self.ls_command()
         elif cmd == "cd":
             if len(args) == 0:
-                return "Введите каталог"  # Изменение поведения при отсутствии аргумента
+                return "Введите каталог"
             else:
                 return self.cd_command(args[0])
         elif cmd == "pwd":
@@ -135,6 +106,52 @@ class ShellEmulator:
         else:
             return f"Команда не найдена: {cmd}"
 
+    def _list_dir(self, directory):
+        directory = directory.rstrip("/") + "/"
+        entries = set()
+        for name in self.zip_file.namelist():
+            if name.startswith(directory.lstrip("/")) and name != directory.lstrip("/"):
+                remainder = name[len(directory.lstrip("/")):]
+                parts = remainder.split('/', 1)
+                entries.add(parts[0])
+        return sorted(entries)
+
+    def _is_dir(self, path):
+        path = path.rstrip("/") + "/"
+        for name in self.zip_file.namelist():
+            if name.startswith(path.lstrip("/")):
+                return True
+        return False
+
+    def _path_exists(self, path):
+        if path.endswith("/"):
+            return self._is_dir(path)
+        return path.lstrip("/").replace("\\", "/") in self.zip_file.namelist()
+
+    def _rename_in_zip(self, src, dst):
+        # zipfile не поддерживает переименование, поэтому создадим временный архив
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".zip")
+        os.close(temp_fd)
+        with zipfile.ZipFile(temp_path, 'w') as temp_zip:
+            for item in self.zip_file.infolist():
+                item_path = "/" + item.filename  # Убедимся, что путь начинается с '/'
+                if item_path.startswith(src if src.endswith("/") else src + "/") or item_path == src:
+                    # Вычисляем новый путь
+                    if item_path == src:
+                        new_item_path = dst
+                    else:
+                        new_item_path = dst.rstrip("/") + "/" + item_path[len(src):]
+                    new_item_path = new_item_path.lstrip("/")
+                    # Читаем данные и записываем по новому пути
+                    data = self.zip_file.read(item.filename)
+                    temp_zip.writestr(new_item_path, data)
+                else:
+                    # Копируем без изменений
+                    temp_zip.writestr(item, self.zip_file.read(item.filename))
+        self.zip_file.close()
+        shutil.move(temp_path, self.fs_zip_path)
+        self.zip_file = zipfile.ZipFile(self.fs_zip_path, 'a')
+
 
 class ShellGUI:
     def __init__(self, emulator):
@@ -143,44 +160,51 @@ class ShellGUI:
         self.root = tk.Tk()
         self.root.title("Shell Emulator")
 
-        self.text_area = scrolledtext.ScrolledText(self.root, width=80, height=24, state='disabled')
+        self.text_area = scrolledtext.ScrolledText(self.root, width=80, height=24)
         self.text_area.pack(pady=5)
+        self.text_area.bind("<Key>", self.on_key_press)
+        self.text_area.bind("<Return>", self.on_enter)
+        self.text_area.bind("<BackSpace>", self.on_backspace)
+        self.text_area.bind("<Control-c>", lambda e: "break")  # Отключаем Ctrl+C
+        self.text_area.bind("<Button-1>", self.on_mouse_click)
+        self.text_area.focus_set()
 
-        self.entry = tk.Entry(self.root, width=80)
-        self.entry.bind("<Return>", self.on_enter)
-        self.entry.pack(pady=5)
+        # Сделать текстовое поле только для чтения, кроме текущей строки ввода
+        self.prompt = self.emulator.get_prompt()
+        self.insert_prompt()
 
-        self.run_button = tk.Button(self.root, text="Run", command=self.execute_command)
-        self.run_button.pack(pady=5)
+    def insert_prompt(self):
+        self.text_area.insert(tk.END, self.prompt)
+        self.text_area.mark_set("input_start", tk.INSERT)
 
-        # Показать начальный prompt
-        self.show_prompt()
+    def on_key_press(self, event):
+        # Разрешаем ввод только в конце текста
+        if self.text_area.compare(tk.INSERT, "<", "input_start"):
+            self.text_area.mark_set(tk.INSERT, tk.END)
+        return
 
-    def show_prompt(self):
-        prompt = self.emulator.get_prompt()
-        self.append_text(prompt)
+    def on_backspace(self, event):
+        # Запрещаем удаление текста перед prompt
+        if self.text_area.compare(tk.INSERT, "<=", "input_start"):
+            return "break"
 
-    def append_text(self, text):
-        self.text_area.config(state='normal')
-        self.text_area.insert(tk.END, text)
-        self.text_area.config(state='disabled')
-        self.text_area.see(tk.END)
+    def on_mouse_click(self, event):
+        # Запрещаем перемещение курсора в предыдущий текст
+        self.text_area.mark_set(tk.INSERT, tk.END)
+        return "break"
 
     def on_enter(self, event):
-        self.execute_command()
-
-    def execute_command(self):
-        cmd = self.entry.get()
-        if cmd.strip():
-            self.append_text(cmd + "\n")
-            result = self.emulator.run_command(cmd)
-            if result == "EXIT":
-                self.root.quit()
-                return
-            if result:
-                self.append_text(result + "\n")
-        self.entry.delete(0, tk.END)
-        self.show_prompt()
+        command = self.text_area.get("input_start", tk.END).strip()
+        self.text_area.insert(tk.END, "\n")
+        result = self.emulator.run_command(command)
+        if result == "EXIT":
+            self.root.quit()
+            return "break"
+        if result:
+            self.text_area.insert(tk.END, result + "\n")
+        self.prompt = self.emulator.get_prompt()
+        self.insert_prompt()
+        return "break"
 
     def run(self):
         self.root.mainloop()
